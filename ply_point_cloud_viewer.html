@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Point Cloud</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #0c0c10; overflow: hidden; }
+  canvas { display: block; }
+  #fly-btn {
+    position: fixed; top: 14px; left: 14px; z-index: 10;
+    font: 11px/1 monospace; color: #777;
+    background: rgba(12,12,16,.8); border: 0.5px solid #2a2a2a;
+    border-radius: 4px; padding: 7px 12px; cursor: pointer;
+  }
+  #fly-btn:hover { color: #bbb; border-color: #444; }
+  #fly-btn.hidden { display: none; }
+  #esc-hint {
+    position: fixed; top: 14px; left: 14px; z-index: 10;
+    font: 11px/1 monospace; color: #3a3a3a; pointer-events: none; display: none;
+  }
+  #esc-hint.visible { display: block; }
+  #hud {
+    position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 14px;
+    font: 11px/1 monospace; color: #444;
+  }
+  #pt-size { width: 80px; accent-color: #3a8fff; cursor: pointer; }
+  #err {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    font: 13px/1.6 monospace; color: #c44; text-align: center; display: none;
+  }
+</style>
+</head>
+<body>
+
+<button id="fly-btn">&#9654; fly</button>
+<span id="esc-hint">ESC to release mouse</span>
+<div id="hud">
+  <span id="info"></span>
+  <label for="pt-size" style="color:#444">size</label>
+  <input id="pt-size" type="range" min="1" max="100" value="50">
+</div>
+<div id="err"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ════════════════════════════════════════════════════════
+   Hard-coded calibrated view.
+   INIT_YAW / INIT_PITCH encode the real-world orientation of
+   the point cloud relative to Three.js world axes.  They are
+   baked into the geometry in buildCloud() so that FPS controls
+   (yaw around world Y, pitch around local X) operate in the
+   calibrated frame from the start — not the raw PLY frame.
+   yaw = 0 / pitch = 0 therefore means: "the good view."
+   ════════════════════════════════════════════════════════ */
+const INIT_POS   = [-68.9785, 61.9855, -81.9431];
+const INIT_YAW   = -0.7  * Math.PI / 180;
+const INIT_PITCH =  82.8 * Math.PI / 180;
+const POINT_SIZE =  0.3684;
+const INIT_SPEED =  1.27;
+
+/* ── renderer ── */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const cam   = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 1e-4, 1e6);
+
+/* ── camera state ────────────────────────────────────────
+   yaw and pitch start at 0 (= the calibrated view).
+   They are fully independent scalars; camQuat is rebuilt
+   every frame as qY(yaw) * qX(pitch) — no accumulation
+   into the quaternion, no axis coupling.
+   ──────────────────────────────────────────────────────── */
+let yaw = 0, pitch = 0;
+const camPos   = new THREE.Vector3();   // set in buildCloud after frame transform
+const camQuat  = new THREE.Quaternion();
+const keys     = {};
+let moveSpeed  = INIT_SPEED;
+let locked     = false;
+
+const flyBtn  = document.getElementById('fly-btn');
+const escHint = document.getElementById('esc-hint');
+
+function requestLock() { renderer.domElement.requestPointerLock(); }
+flyBtn.addEventListener('click', requestLock);
+renderer.domElement.addEventListener('click', () => { if (!locked) requestLock(); });
+
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  flyBtn.classList.toggle('hidden', locked);
+  escHint.classList.toggle('visible', locked);
+  renderer.domElement.style.cursor = locked ? 'none' : 'default';
+});
+
+document.addEventListener('mousemove', e => {
+  if (!locked) return;
+  yaw   -= e.movementX * 0.0018;   // X → yaw  (independent)
+  pitch -= e.movementY * 0.0018;   // Y → pitch (independent)
+});
+
+window.addEventListener('keydown', e => { keys[e.code] = true;  });
+window.addEventListener('keyup',   e => { keys[e.code] = false; });
+
+renderer.domElement.addEventListener('wheel', e => {
+  moveSpeed *= e.deltaY > 0 ? 1.15 : 0.87;
+  moveSpeed  = Math.max(1e-4, Math.min(50, moveSpeed));
+}, { passive: true });
+
+/* ── circular point sprite ── */
+function circleSprite() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32,32,0,32,32,32);
+  g.addColorStop(0,    'rgba(255,255,255,1)');
+  g.addColorStop(0.55, 'rgba(255,255,255,1)');
+  g.addColorStop(1,    'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(32,32,32,0,Math.PI*2); ctx.fill();
+  return new THREE.CanvasTexture(c);
+}
+
+/* ── PLY parser (ASCII + binary LE/BE) ── */
+function parsePLY(buf) {
+  const dv=new DataView(buf), dec=new TextDecoder();
+  let pos=0, headerEnd=0;
+  const lines=[];
+  while (pos < buf.byteLength) {
+    if (dv.getUint8(pos)===10) {
+      lines.push(dec.decode(new Uint8Array(buf,headerEnd,pos-headerEnd)).trim());
+      headerEnd=pos+1;
+      if (lines[lines.length-1]==='end_header') break;
+    }
+    pos++;
+  }
+  const dataStart=headerEnd;
+  let format='ascii', nVerts=0;
+  const props=[]; let inVert=false;
+  for (const l of lines) {
+    if (l.startsWith('format '))         format=l.split(' ')[1];
+    if (l.startsWith('element vertex ')){ nVerts=+l.split(' ')[2]; inVert=true; }
+    else if (l.startsWith('element '))   inVert=false;
+    else if (inVert&&l.startsWith('property ')){ const p=l.split(' '); props.push({type:p[1],name:p[2]}); }
+  }
+  const tb=t=>(t==='float'||t==='float32'||t==='int'||t==='uint'||t==='int32'||t==='uint32')?4
+    :(t==='double'||t==='float64')?8:(t==='short'||t==='ushort'||t==='int16'||t==='uint16')?2:1;
+  const find=(...ns)=>{ for(const n of ns){const i=props.findIndex(p=>p.name===n);if(i>=0)return i;} return -1; };
+  const xi=find('x'),yi=find('y'),zi=find('z');
+  const ri=find('red','r'),gi=find('green','g'),bi=find('blue','b');
+  const hasCol=ri>=0&&gi>=0&&bi>=0;
+  const positions=new Float32Array(nVerts*3);
+  const colors=hasCol?new Float32Array(nVerts*3):null;
+  if (format==='ascii') {
+    const vl=dec.decode(new Uint8Array(buf,dataStart)).split('\n');
+    for(let v=0;v<nVerts;v++){
+      const t=vl[v].trim().split(/\s+/).map(Number);
+      positions[v*3]=t[xi];positions[v*3+1]=t[yi];positions[v*3+2]=t[zi];
+      if(hasCol){colors[v*3]=t[ri]/255;colors[v*3+1]=t[gi]/255;colors[v*3+2]=t[bi]/255;}
+    }
+  } else {
+    const le=format.includes('little');
+    const stride=props.reduce((s,p)=>s+tb(p.type),0);
+    const read=(type,o)=>{
+      switch(type){
+        case 'float':case 'float32':return dv.getFloat32(o,le);
+        case 'double':case 'float64':return dv.getFloat64(o,le);
+        case 'int':case 'int32':return dv.getInt32(o,le);
+        case 'uint':case 'uint32':return dv.getUint32(o,le);
+        case 'short':case 'int16':return dv.getInt16(o,le);
+        case 'ushort':case 'uint16':return dv.getUint16(o,le);
+        default:return dv.getUint8(o);
+      }
+    };
+    let off=dataStart;
+    for(let v=0;v<nVerts;v++){
+      let p=off;
+      const vals=props.map(pr=>{const val=read(pr.type,p);p+=tb(pr.type);return val;});
+      positions[v*3]=vals[xi];positions[v*3+1]=vals[yi];positions[v*3+2]=vals[zi];
+      if(hasCol){colors[v*3]=vals[ri]/255;colors[v*3+1]=vals[gi]/255;colors[v*3+2]=vals[bi]/255;}
+      off+=stride;
+    }
+  }
+  return {positions,colors,hasCol,nVerts};
+}
+
+/* ── build cloud ─────────────────────────────────────────
+   Three transforms applied to the positions in order:
+   1. Centre the cloud at the origin.
+   2. Axis remap (swapYZ + flipZ): raw PLY (x,y,z) → (x, z, −y).
+   3. Calibration bake: apply invBase so that the camera at
+      yaw=0, pitch=0 sees exactly the INIT_YAW/INIT_PITCH view.
+   The camera start position is also mapped into this new frame.
+   ──────────────────────────────────────────────────────── */
+let pointsMesh = null;
+
+function buildCloud({positions,colors,hasCol,nVerts}) {
+  /* bounding box & centre */
+  let mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];
+  for(let v=0;v<nVerts;v++)
+    for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],positions[v*3+k]);mx[k]=Math.max(mx[k],positions[v*3+k]);}
+  const center=mn.map((v,i)=>(v+mx[i])/2);
+  const maxExt=Math.max(...mn.map((v,i)=>mx[i]-v));
+
+  /* invBase: inverse of the initial calibrated camera orientation */
+  const invBase = new THREE.Quaternion()
+    .setFromEuler(new THREE.Euler(INIT_PITCH, INIT_YAW, 0, 'YXZ'))
+    .invert();
+
+  /* apply all three transforms in one pass */
+  const _p = new THREE.Vector3();
+  for (let v=0; v<nVerts; v++) {
+    /* 1. centre */
+    const cx = positions[v*3]  -center[0];
+    const cy = positions[v*3+1]-center[1];
+    const cz = positions[v*3+2]-center[2];
+    /* 2. axis remap: swapYZ + flipZ → (x, z, −y) */
+    _p.set(cx, cz, -cy);
+    /* 3. calibration bake */
+    _p.applyQuaternion(invBase);
+    positions[v*3]=_p.x; positions[v*3+1]=_p.y; positions[v*3+2]=_p.z;
+  }
+
+  /* camera: transform the calibrated position into the same frame */
+  camPos.copy(new THREE.Vector3(...INIT_POS).applyQuaternion(invBase));
+
+  cam.far=maxExt*50; cam.updateProjectionMatrix();
+
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(positions,3));
+  if(hasCol) geo.setAttribute('color',new THREE.BufferAttribute(colors,3));
+
+  const mat=new THREE.PointsMaterial({
+    size:POINT_SIZE, map:circleSprite(),
+    vertexColors:hasCol, color:hasCol?0xffffff:0x55aaff,
+    alphaTest:0.4, transparent:true, sizeAttenuation:true, depthWrite:false,
+  });
+  pointsMesh=new THREE.Points(geo,mat);
+  scene.add(pointsMesh);
+  document.getElementById('info').textContent=nVerts.toLocaleString()+' pts';
+}
+
+/* ── size slider ── */
+document.getElementById('pt-size').addEventListener('input',function(){
+  if(!pointsMesh) return;
+  const t=(this.value-1)/99;
+  pointsMesh.material.size=POINT_SIZE*Math.pow(10,t*2-1);
+});
+
+/* ── camera update ───────────────────────────────────────
+   Rebuilt every frame from two independent scalars.
+   yaw  → rotation around world Y (always the gravity axis).
+   pitch → rotation around the camera's local X after yaw.
+   Because the geometry is pre-rotated by invBase, world Y
+   here IS the calibrated up axis.  No gimbal issues.
+   ──────────────────────────────────────────────────────── */
+const _fwd    = new THREE.Vector3();
+const _right  = new THREE.Vector3();
+const _qY     = new THREE.Quaternion();
+const _qX     = new THREE.Quaternion();
+const _worldY = new THREE.Vector3(0,1,0);
+const _worldX = new THREE.Vector3(1,0,0);
+
+function updateCam() {
+  /* compose fresh each frame — no drift, no coupling */
+  _qY.setFromAxisAngle(_worldY, yaw);
+  _qX.setFromAxisAngle(_worldX, pitch);
+  camQuat.copy(_qY).multiply(_qX);
+
+  if (locked) {
+    _fwd.set(0,0,-1).applyQuaternion(camQuat);
+    _right.set(1,0,0).applyQuaternion(camQuat);
+    const spd=moveSpeed*(keys['ShiftLeft']||keys['ShiftRight']?5:1);
+    if(keys['KeyW']||keys['ArrowUp'])    camPos.addScaledVector(_fwd,   spd);
+    if(keys['KeyS']||keys['ArrowDown'])  camPos.addScaledVector(_fwd,  -spd);
+    if(keys['KeyA']||keys['ArrowLeft'])  camPos.addScaledVector(_right,-spd);
+    if(keys['KeyD']||keys['ArrowRight']) camPos.addScaledVector(_right, spd);
+    if(keys['KeyE']||keys['Space'])      camPos.y+=spd;
+    if(keys['KeyQ']||keys['ControlLeft']||keys['ControlRight']) camPos.y-=spd;
+  }
+  cam.position.copy(camPos);
+  cam.quaternion.copy(camQuat);
+}
+
+window.addEventListener('resize',()=>{
+  cam.aspect=innerWidth/innerHeight; cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+/* ── load ── */
+fetch('point_cloud.ply')
+  .then(r=>{if(!r.ok)throw new Error(r.status);return r.arrayBuffer();})
+  .then(buf=>buildCloud(parsePLY(buf)))
+  .catch(e=>{
+    document.getElementById('err').style.display='block';
+    document.getElementById('err').textContent='Could not load point_cloud.ply\n'+e.message;
+  });
+
+(function loop(){ requestAnimationFrame(loop); updateCam(); renderer.render(scene,cam); })();
+</script>
+</body>
+</html>
