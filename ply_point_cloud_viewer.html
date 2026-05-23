@@ -292,7 +292,7 @@ window.addEventListener('resize',()=>{
 });
 
 /* ── load ── */
-fetch('point_cloud.ply')
+fetch('https://natlandsmyr.com/hovedbygningen-dataset/point_cloud.ply')
   .then(r=>{if(!r.ok)throw new Error(r.status);return r.arrayBuffer();})
   .then(buf=>buildCloud(parsePLY(buf)))
   .catch(e=>{
