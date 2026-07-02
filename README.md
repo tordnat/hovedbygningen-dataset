@@ -37,7 +37,7 @@ Design files, bill of materials, and capture software are open source: [tordnat/
 
 ## Download
 
-*Download links coming soon.*
+*[Download link](https://drive.google.com/file/d/1h4xDytiXU9uOH0J_rufSAdYXJ_FDYlys/view?usp=sharing)*
 
 ## Citation
 
