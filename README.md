@@ -13,7 +13,7 @@ Stereo SfM dataset of the main building of the Norwegian University of Science a
 
 ## The sequences
 
-The dataset contains three sequences, each captured in a single handheld traversal. Because each stereo frame overlaps mainly with its temporal neighbours, the sequences have the low covisibility typical of structured survey-style captures — a regime not represented in curated benchmarks such as ETH3D or internet photo collections.
+The dataset contains three sequences, each captured in a single handheld traversal. Because each stereo frame overlaps mainly with its temporal neighbours, the sequences have the low covisibility typical of structured survey-style captures. Unlike most curated benchmarks, the sequences were captured with a fully documented rig that others can rebuild, and every sequence includes synchronized IMU data.
 
 | Sequence | Images | Stereo pairs | Scene | Trajectory |
 |---|---|---|---|---|
